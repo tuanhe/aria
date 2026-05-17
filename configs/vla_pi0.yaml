@@ -1,0 +1,31 @@
+mode: vla
+graph_dir: compiled/pi0
+weight_path: weights/pi0_weights.bin
+
+vision:
+  resolution: [224, 224]
+  tile_size: [224, 224]      # 单tile，1块
+  tokens_per_tile: 256
+  feat_dim: 4096
+
+llm:
+  num_layers: 32
+  hidden_dim: 4096
+  num_heads: 32
+  head_dim: 128
+  vocab_size: 32000
+  # VLA指令短，seq_len范围集中
+  prefill_buckets: [512, 768, 1024]
+  decode_buckets:  [512, 768, 1024]
+  max_seq_len: 2048
+
+action:
+  head_type: flow_matching
+  action_dim: 7              # 机械臂7自由度
+  action_horizon: 16         # 预测未来16步
+  num_denoise_steps: 15      # Flow去噪步数
+
+max_batch: 1
+pad_token_id: 0
+bos_token_id: 1
+eos_token_id: 2

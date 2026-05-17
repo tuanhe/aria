@@ -1,0 +1,59 @@
+[build-system]
+requires      = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name            = "aria"
+version         = "0.1.0"
+description     = "Action Reasoning Inference Accelerator — 端侧 NPU 推理框架（VLA / VLM）"
+readme          = "README.md"
+license         = { text = "MIT" }
+requires-python = ">=3.9"
+authors         = [{ name = "ARIA contributors" }]
+keywords        = ["npu", "vla", "vlm", "edge-ai", "inference"]
+classifiers     = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    "numpy>=1.24.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+onnx = [
+    "onnx>=1.14.0",
+    "onnxruntime>=1.16.0",
+]
+torch = [
+    "torch>=2.1.0",
+]
+dev = [
+    "pytest>=7.0.0",
+]
+# Orin / 桌面 CUDA 上的 TensorRT 后端。
+# tensorrt / cuda-python 在 Jetson 镜像上通常已预装，
+# 但这里仍然声明，方便其他平台对齐版本。
+trt = [
+    "tensorrt>=10.0",
+    "cuda-python>=12.0",
+]
+# ONNXRuntime 后端：用来演示"权重一份 + 多图共享"，TRT 做不到这件事。
+ort = [
+    "onnx>=1.14.0",
+    "onnxruntime>=1.16.0",
+]
+
+[project.scripts]
+aria       = "aria.cli:main"
+aria-build = "aria.tools.build_dummy_engines:main"
+
+[project.urls]
+Homepage = "https://github.com/"
+
+[tool.setuptools.packages.find]
+include = ["aria*"]
+exclude = ["tests*", "configs*"]

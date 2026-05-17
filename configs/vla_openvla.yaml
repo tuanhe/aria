@@ -1,0 +1,31 @@
+mode: vla
+graph_dir: compiled/openvla
+weight_path: weights/openvla_weights.bin
+
+vision:
+  resolution: [336, 336]
+  tile_size: [336, 336]      # 单tile
+  tokens_per_tile: 256
+  feat_dim: 4096
+
+llm:
+  num_layers: 32
+  hidden_dim: 4096
+  num_heads: 32
+  head_dim: 128
+  vocab_size: 32000
+  prefill_buckets: [512, 768, 1024]
+  decode_buckets:  [512, 768, 1024]
+  max_seq_len: 2048
+
+action:
+  head_type: autoregressive
+  action_dim: 7
+  action_horizon: 1          # AR模式每次生成当前步动作
+  num_action_tokens: 7       # 7个自由度各一个token
+  action_token_start: 31744  # 动作token在词表中的起始位置
+
+max_batch: 1
+pad_token_id: 0
+bos_token_id: 1
+eos_token_id: 2

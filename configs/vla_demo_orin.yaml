@@ -1,0 +1,33 @@
+# 给 Orin 上 TensorRT 后端跑通端到端用的 demo 配置。
+# 维度刻意压小，目的是让 .engine 能在合理时间/内存内构建出来，
+# 重点是验证 NPU 抽象层 + 流水线，不是模型精度。
+mode: vla
+graph_dir: compiled/demo_orin
+weight_path: weights/demo_random.bin
+
+vision:
+  resolution: [224, 224]
+  tile_size:  [224, 224]
+  tokens_per_tile: 64
+  feat_dim: 256
+
+llm:
+  num_layers: 4
+  hidden_dim: 256
+  num_heads:  4
+  head_dim:   64
+  vocab_size: 4096
+  prefill_buckets: [128, 256]
+  decode_buckets:  [128, 256]
+  max_seq_len: 512
+
+action:
+  head_type: flow_matching
+  action_dim: 7
+  action_horizon: 8
+  num_denoise_steps: 4
+
+max_batch: 1
+pad_token_id: 0
+bos_token_id: 1
+eos_token_id: 2

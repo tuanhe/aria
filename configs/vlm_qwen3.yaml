@@ -1,0 +1,32 @@
+mode: vlm
+graph_dir: compiled/qwen3vl
+weight_path: weights/qwen3vl_weights.bin
+
+vision:
+  resolution: [448, 448]     # 端侧固定分辨率
+  tile_size: [224, 224]      # 2×2=4个tile
+  tokens_per_tile: 256
+  feat_dim: 4096
+
+llm:
+  num_layers: 28
+  hidden_dim: 3584
+  num_heads: 28
+  head_dim: 128
+  vocab_size: 152064         # Qwen3词表大小
+  # VLM多轮对话，seq_len范围更大
+  prefill_buckets: [512, 1024, 2048, 3072]
+  decode_buckets:  [512, 1024, 2048, 3072]
+  max_seq_len: 4096
+
+text:
+  max_new_tokens: 512
+  do_sample: true
+  temperature: 0.7
+  top_p: 0.9
+  eos_token_ids: [151645, 151643]   # Qwen3的<|im_end|>和<|endoftext|>
+
+max_batch: 1
+pad_token_id: 0
+bos_token_id: 151643
+eos_token_id: 151645
