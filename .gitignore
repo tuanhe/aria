@@ -1,0 +1,131 @@
+# ============================================================
+# ARIA 项目专属
+# ============================================================
+
+# 编译产物：每个 backend 编出来的 .engine / .bin / .onnx / .npz，体积大
+# 用目录级 ignore 不用通配后缀，避免误伤 tests/ 等地方的 fixture
+compiled/
+
+# 模型权重 / 配置里 weight_path 指向的目录
+weights/
+*.safetensors
+*.gguf
+*.engine
+*.plan
+
+# 日志
+logs/
+*.log
+
+# 性能分析输出
+*.prof
+*.nvvp
+*.nsys-rep
+profiling_*.json
+
+
+# ============================================================
+# Python
+# ============================================================
+
+# 字节码
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C 扩展
+*.so
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+MANIFEST
+pip-wheel-metadata/
+share/python-wheels/
+
+# 安装的标记（不用 *.pth，会跟 PyTorch checkpoint 后缀混淆）
+.installed.cfg
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+.env
+
+# pip
+pip-log.txt
+pip-delete-this-directory.txt
+
+
+# ============================================================
+# 测试 / 类型检查 / 覆盖率
+# ============================================================
+
+.pytest_cache/
+.cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover
+.hypothesis/
+.tox/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+
+
+# ============================================================
+# 编辑器 / IDE
+# ============================================================
+
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+
+# ============================================================
+# OS
+# ============================================================
+
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+
+# ============================================================
+# Claude Code（本地用户态配置，不要进库）
+# ============================================================
+
+.claude/settings.local.json
+.claude/cache/
+.claude/sessions/
+
+
+# ============================================================
+# 不要 ignore 的（白名单覆盖）
+# ============================================================
+
+# 示例 yaml 一定要进库
+!configs/*.yaml
+
+# docs 下的 markdown 源要进库（PDF 是否提交看个人偏好）
+!docs/*.md
