@@ -16,6 +16,7 @@ import numpy as np
 
 from aria.core.executor import NPUExecutor, MockNPUExecutor
 from aria.core.kv_cache import KVCacheManager
+from aria.core.prefix_cache import PrefixCache
 from aria.models.base import FrameworkConfig
 from aria.models.vision_encoder import VisionEncoder
 from aria.models.llm_backbone import LLMBackbone
@@ -63,10 +64,12 @@ class VLMRuntime:
     """
 
     def __init__(self,
-                 config:   FrameworkConfig,
-                 executor: NPUExecutor):
-        self.config   = config
-        self.executor = executor
+                 config:       FrameworkConfig,
+                 executor:     NPUExecutor,
+                 prefix_cache: Optional[PrefixCache] = None):
+        self.config       = config
+        self.executor     = executor
+        self.prefix_cache = prefix_cache
 
         # 每个session独立的KV Cache
         # 端侧通常单session，这里用dict支持多session扩展
@@ -75,16 +78,21 @@ class VLMRuntime:
         # 子模块（所有session共享）
         self.vision_encoder = VisionEncoder(config, executor)
 
-        logger.info("[ARIA/VLM] 初始化完成")
+        msg = "[ARIA/VLM] 初始化完成"
+        if prefix_cache is not None:
+            msg += (f" prefix_cache=on(block={prefix_cache.block_size} "
+                    f"capacity={prefix_cache.capacity_blocks})")
+        logger.info(msg)
 
     @classmethod
     def from_config(cls,
-                    config:   FrameworkConfig,
-                    executor: Optional[NPUExecutor] = None) -> "VLMRuntime":
+                    config:       FrameworkConfig,
+                    executor:     Optional[NPUExecutor]  = None,
+                    prefix_cache: Optional[PrefixCache]  = None) -> "VLMRuntime":
         if executor is None:
             executor = MockNPUExecutor()
             logger.info("[ARIA/VLM] 使用MockNPUExecutor")
-        return cls(config, executor)
+        return cls(config, executor, prefix_cache=prefix_cache)
 
     # ------------------------------------------------------------------
     # Session管理
@@ -149,7 +157,7 @@ class VLMRuntime:
         token_ids, vision_feat = self._parse_messages(messages)
         t_parse = (time.perf_counter() - t0) * 1000
 
-        # 检查KV Cache空间
+        # 检查KV Cache空间（按未命中前缀缓存的总长度算上限）
         new_len = len(token_ids) + (
             self.config.vision.total_vision_tokens if vision_feat is not None else 0
         )
@@ -158,6 +166,27 @@ class VLMRuntime:
                 f"KV Cache不足: 当前={session.current_kv_len} "
                 f"新增={new_len} 最大={self.config.llm.max_seq_len}"
             )
+
+        # Step 1.5: 前缀缓存查询（仅在新 session + 纯文本时启用）
+        # 图像模式下 token_ids 里的 vision 位置是占位 BOS，跟实际 vision_feat
+        # 解耦，命中错位会用错 KV，所以图像分支不走这里。
+        full_user_tokens = list(token_ids)   # 留作 insert 时的 key
+        prefix_hit_blocks = 0
+        if (self.prefix_cache is not None
+            and session.history_kv_len == 0
+            and vision_feat is None
+            and len(token_ids) >= self.prefix_cache.block_size):
+
+            arr   = np.array(token_ids, dtype=np.int32)
+            match = self.prefix_cache.match(arr)
+            if match.num_blocks > 0:
+                session.kv_cache.bulk_load_prefix(match.gather())
+                prefix_hit_blocks = match.num_blocks
+                token_ids = token_ids[match.matched_tokens:]
+                logger.info(
+                    f"[ARIA/VLM] prefix-cache 命中: "
+                    f"{match.num_blocks} blocks ({match.matched_tokens} tokens)"
+                )
 
         # Step 2: Prefill（只对新增内容做Prefill，历史复用KV Cache）
         t0 = time.perf_counter()
@@ -187,12 +216,21 @@ class VLMRuntime:
         session.add_user_turn(messages, token_ids)
         session.add_assistant_turn(response, gen_ids)
 
+        # Step 7: 把用户消息的 KV 写回前缀缓存（已存在的 block 会去重）
+        if self.prefix_cache is not None and vision_feat is None and full_user_tokens:
+            arr      = np.array(full_user_tokens, dtype=np.int32)
+            user_kv  = session.kv_cache.read_range(0, len(arr))
+            inserted = self.prefix_cache.insert(arr, user_kv)
+            if inserted > 0:
+                logger.info(f"[ARIA/VLM] prefix-cache 写入: +{inserted} blocks")
+
         t_total = (time.perf_counter() - t_start) * 1000
         logger.info(
             f"[ARIA/VLM] 推理完成 session={session.session_id} "
             f"parse={t_parse:.1f}ms prefill={t_prefill:.1f}ms "
             f"decode={t_decode:.1f}ms total={t_total:.1f}ms "
-            f"生成={len(gen_ids)}tokens"
+            f"生成={len(gen_ids)}tokens "
+            f"prefix_hit={prefix_hit_blocks}blk"
         )
 
         # 临时session用完即关闭

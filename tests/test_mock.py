@@ -10,9 +10,10 @@ import logging
 import numpy as np
 import pytest
 
-from aria.core.executor  import MockNPUExecutor
-from aria.core.kv_cache  import KVCacheManager
-from aria.models.base    import FrameworkConfig
+from aria.core.executor      import MockNPUExecutor
+from aria.core.kv_cache      import KVCacheManager
+from aria.core.prefix_cache  import PrefixCache, _block_hash, _ROOT_HASH
+from aria.models.base        import FrameworkConfig
 from aria.runtime.vla_runtime import VLARuntime
 from aria.runtime.vlm_runtime import VLMRuntime
 
@@ -143,6 +144,179 @@ class TestKVCache:
         kv.reset()
         assert kv.valid_len   == 0
         assert kv.history_len == 0
+
+
+# ------------------------------------------------------------------
+# Prefix Cache 测试
+# ------------------------------------------------------------------
+
+class TestPrefixCache:
+
+    def test_basic_match_insert(self):
+        cache = PrefixCache(num_layers=2, num_heads=4, head_dim=8,
+                            block_size=4, capacity_blocks=16)
+        toks = np.arange(12, dtype=np.int32)
+        kv   = np.random.default_rng(0).standard_normal(
+            (2, 2, 4, 12, 8)
+        ).astype(np.float16)
+
+        # 首次：全 miss
+        m = cache.match(toks)
+        assert m.num_blocks == 0
+        assert not m
+
+        # 写入 12 个 token → 3 个块
+        added = cache.insert(toks, kv)
+        assert added == 3
+        assert cache.stats()["used"] == 3
+
+        # 再次：3 块全命中
+        m = cache.match(toks)
+        assert m.num_blocks == 3
+        assert m.matched_tokens == 12
+        assert bool(m) is True
+
+        # gather 出来的 KV 应该和写入时一致
+        kv_back = m.gather()
+        assert kv_back.shape == (2, 2, 4, 12, 8)
+        assert np.array_equal(kv_back, kv)
+
+    def test_partial_prefix_match(self):
+        """同前缀块命中，后续块发散后停止匹配"""
+        cache = PrefixCache(num_layers=2, num_heads=4, head_dim=8,
+                            block_size=4, capacity_blocks=16)
+        toks1 = np.array([1, 2, 3, 4,  5, 6, 7, 8,  9, 10, 11, 12], dtype=np.int32)
+        kv1   = np.random.default_rng(1).standard_normal(
+            (2, 2, 4, 12, 8)
+        ).astype(np.float16)
+        cache.insert(toks1, kv1)
+
+        # 第一块完全相同，第二块开始不同
+        toks2 = np.array([1, 2, 3, 4,  99, 99, 99, 99,  77, 77, 77, 77], dtype=np.int32)
+        m = cache.match(toks2)
+        assert m.num_blocks == 1
+        assert m.matched_tokens == 4
+        # 命中那一块的 KV 等于 toks1 第一块
+        assert np.array_equal(m.gather(), kv1[:, :, :, :4, :])
+
+    def test_block_alignment_tail_dropped(self):
+        """长度不是 block_size 的倍数时，尾部 token 不缓存"""
+        cache = PrefixCache(num_layers=1, num_heads=1, head_dim=4,
+                            block_size=4, capacity_blocks=8)
+        # 10 个 token = 2 完整块 + 2 个尾部
+        toks = np.arange(10, dtype=np.int32)
+        kv   = np.zeros((1, 2, 1, 10, 4), dtype=np.float16)
+        added = cache.insert(toks, kv)
+        assert added == 2   # 只缓存 8 个 token
+
+    def test_lru_eviction(self):
+        """容量 = 2 块，写入 3 个独立前缀 → 最早那个被淘汰"""
+        cache = PrefixCache(num_layers=1, num_heads=1, head_dim=4,
+                            block_size=4, capacity_blocks=2)
+        rng  = np.random.default_rng(2)
+        # 3 个互不重叠的单块前缀（不同 token 序列）
+        prefixes = [
+            np.array([10, 11, 12, 13], dtype=np.int32),
+            np.array([20, 21, 22, 23], dtype=np.int32),
+            np.array([30, 31, 32, 33], dtype=np.int32),
+        ]
+        for p in prefixes:
+            kv = rng.standard_normal((1, 2, 1, 4, 4)).astype(np.float16)
+            cache.insert(p, kv)
+
+        s = cache.stats()
+        assert s["used"]      == 2
+        assert s["evictions"] == 1
+
+        # 第一个前缀应该已经被淘汰
+        assert cache.match(prefixes[0]).num_blocks == 0
+        # 后两个还在
+        assert cache.match(prefixes[1]).num_blocks == 1
+        assert cache.match(prefixes[2]).num_blocks == 1
+
+    def test_lru_keeps_recent(self):
+        """访问过的块会被推到 LRU 末尾，避免被淘汰"""
+        cache = PrefixCache(num_layers=1, num_heads=1, head_dim=4,
+                            block_size=4, capacity_blocks=2)
+        rng  = np.random.default_rng(3)
+        p_a  = np.array([1, 2, 3, 4],   dtype=np.int32)
+        p_b  = np.array([5, 6, 7, 8],   dtype=np.int32)
+        p_c  = np.array([9, 10, 11, 12], dtype=np.int32)
+
+        cache.insert(p_a, rng.standard_normal((1, 2, 1, 4, 4)).astype(np.float16))
+        cache.insert(p_b, rng.standard_normal((1, 2, 1, 4, 4)).astype(np.float16))
+
+        # 访问 p_a，把它推到 LRU 末尾
+        assert cache.match(p_a).num_blocks == 1
+
+        # 再插入 p_c：应淘汰 p_b（不是 p_a）
+        cache.insert(p_c, rng.standard_normal((1, 2, 1, 4, 4)).astype(np.float16))
+
+        assert cache.match(p_a).num_blocks == 1
+        assert cache.match(p_b).num_blocks == 0
+        assert cache.match(p_c).num_blocks == 1
+
+    def test_insert_dedupe(self):
+        """相同前缀重复写入不会重复占 slot"""
+        cache = PrefixCache(num_layers=1, num_heads=1, head_dim=4,
+                            block_size=4, capacity_blocks=8)
+        toks = np.array([1, 2, 3, 4,  5, 6, 7, 8], dtype=np.int32)
+        kv   = np.zeros((1, 2, 1, 8, 4), dtype=np.float16)
+
+        added1 = cache.insert(toks, kv)
+        added2 = cache.insert(toks, kv)
+        assert added1 == 2
+        assert added2 == 0
+        assert cache.stats()["used"] == 2
+
+    def test_hash_chain_order_matters(self):
+        """链式哈希：相同 token 集合不同顺序，哈希应该不同"""
+        h1 = _block_hash(_ROOT_HASH, np.array([1, 2, 3, 4], dtype=np.int32))
+        h2 = _block_hash(_ROOT_HASH, np.array([4, 3, 2, 1], dtype=np.int32))
+        assert h1 != h2
+
+    def test_clear(self):
+        cache = PrefixCache(num_layers=1, num_heads=1, head_dim=4,
+                            block_size=4, capacity_blocks=4)
+        cache.insert(np.arange(8, dtype=np.int32),
+                     np.zeros((1, 2, 1, 8, 4), dtype=np.float16))
+        assert cache.stats()["used"] == 2
+        cache.clear()
+        assert cache.stats()["used"] == 0
+        assert cache.match(np.arange(4, dtype=np.int32)).num_blocks == 0
+
+
+# ------------------------------------------------------------------
+# KVCacheManager 的前缀回灌
+# ------------------------------------------------------------------
+
+class TestKVCachePrefixLoad:
+
+    def test_bulk_load_prefix(self):
+        kv = KVCacheManager(num_layers=2, num_heads=4, head_dim=8,
+                            max_seq_len=64, max_batch=1)
+        prefix = np.full((2, 2, 4, 12, 8), 7, dtype=np.float16)
+        kv.bulk_load_prefix(prefix)
+        assert kv.valid_len   == 12
+        assert kv.history_len == 12
+        # 读回来验证
+        rk, rv = kv.get_kv(0)
+        assert rk.shape == (1, 4, 12, 8)
+        assert np.all(rk == 7)
+        assert np.all(rv == 7)
+
+    def test_read_range(self):
+        kv = KVCacheManager(num_layers=2, num_heads=4, head_dim=8,
+                            max_seq_len=64, max_batch=1)
+        k = np.full((1, 4, 20, 8), 3, dtype=np.float16)
+        v = np.full((1, 4, 20, 8), 5, dtype=np.float16)
+        for l in range(2):
+            kv.write_prefill(l, k, v)
+
+        chunk = kv.read_range(4, 16)
+        assert chunk.shape == (2, 2, 4, 12, 8)
+        assert np.all(chunk[:, 0] == 3)  # K
+        assert np.all(chunk[:, 1] == 5)  # V
 
 
 # ------------------------------------------------------------------
@@ -287,6 +461,86 @@ class TestVLMRuntime:
 
         runtime.close_session(session_id)
 
+    def test_prefix_cache_hit(self):
+        """同样的纯文本输入，第二次应命中前缀缓存"""
+        cfg      = make_vlm_config()
+        executor = MockNPUExecutor(latency_ms=0.5)
+        pc       = PrefixCache(
+            num_layers      = cfg.llm.num_layers,
+            num_heads       = cfg.llm.num_heads,
+            head_dim        = cfg.llm.head_dim,
+            block_size      = 4,
+            capacity_blocks = 64,
+        )
+        runtime = VLMRuntime.from_config(cfg, executor, prefix_cache=pc)
+
+        msg = [{"role": "user", "content": "the quick brown fox jumps over the lazy dog"}]
+
+        # 第一次：全 miss，但会写回
+        runtime.chat(msg)
+        s1 = pc.stats()
+        assert s1["block_hits"]   == 0
+        assert s1["block_misses"] > 0
+        used_after_first = s1["used"]
+        print(f"After 1st call: {pc!r}")
+
+        # 第二次：相同 prefix → 应有命中
+        runtime.chat(msg)
+        s2 = pc.stats()
+        assert s2["block_hits"] >= used_after_first
+        assert s2["hit_rate"] > 0.0
+        print(f"After 2nd call: {pc!r}")
+
+    def test_prefix_cache_skipped_for_image(self):
+        """图像输入不应触发前缀缓存"""
+        cfg      = make_vlm_config()
+        executor = MockNPUExecutor(latency_ms=0.5)
+        pc       = PrefixCache(
+            num_layers      = cfg.llm.num_layers,
+            num_heads       = cfg.llm.num_heads,
+            head_dim        = cfg.llm.head_dim,
+            block_size      = 8,
+            capacity_blocks = 64,
+        )
+        runtime = VLMRuntime.from_config(cfg, executor, prefix_cache=pc)
+
+        image = make_dummy_image(448, 448)
+        msg   = [{"role": "user", "content": [
+            {"type": "image", "data": image},
+            {"type": "text",  "data": "describe"},
+        ]}]
+        runtime.chat(msg)
+        # 图像分支：既不查也不写
+        s = pc.stats()
+        assert s["block_hits"]   == 0
+        assert s["block_misses"] == 0
+        assert s["used"]         == 0
+
+    def test_prefix_cache_partial_share(self):
+        """两次查询共享前缀但后缀不同，应部分命中"""
+        cfg      = make_vlm_config()
+        executor = MockNPUExecutor(latency_ms=0.5)
+        pc       = PrefixCache(
+            num_layers      = cfg.llm.num_layers,
+            num_heads       = cfg.llm.num_heads,
+            head_dim        = cfg.llm.head_dim,
+            block_size      = 4,
+            capacity_blocks = 64,
+        )
+        runtime = VLMRuntime.from_config(cfg, executor, prefix_cache=pc)
+
+        # 共享前缀 "you are a helpful assistant " (28 字符) 后面接不同问题
+        prefix = "you are a helpful assistant "
+        runtime.chat([{"role": "user", "content": prefix + "what is rust"}])
+        before_hits = pc.stats()["block_hits"]
+
+        runtime.chat([{"role": "user", "content": prefix + "what is python"}])
+        after_hits  = pc.stats()["block_hits"]
+
+        # 第二次应该命中共享前缀的若干块
+        assert after_hits > before_hits
+        print(f"Partial-share hits: +{after_hits - before_hits} blocks")
+
     def test_temp_session(self):
         """不传session_id时，应该自动创建临时session并在完成后清理"""
         cfg      = make_vlm_config()
@@ -360,7 +614,7 @@ if __name__ == "__main__":
     print("=" * 60)
 
     # KV Cache
-    print("\n[1/3] KV Cache测试...")
+    print("\n[1/4] KV Cache测试...")
     t = TestKVCache()
     t.test_prefill_write_read()
     t.test_decode_step()
@@ -368,8 +622,24 @@ if __name__ == "__main__":
     t.test_reset()
     print("  ✓ KV Cache全部通过")
 
+    # Prefix Cache
+    print("\n[2/4] Prefix Cache测试...")
+    t = TestPrefixCache()
+    t.test_basic_match_insert()
+    t.test_partial_prefix_match()
+    t.test_block_alignment_tail_dropped()
+    t.test_lru_eviction()
+    t.test_lru_keeps_recent()
+    t.test_insert_dedupe()
+    t.test_hash_chain_order_matters()
+    t.test_clear()
+    t = TestKVCachePrefixLoad()
+    t.test_bulk_load_prefix()
+    t.test_read_range()
+    print("  ✓ Prefix Cache全部通过")
+
     # VLA
-    print("\n[2/3] VLA推理测试...")
+    print("\n[3/4] VLA推理测试...")
     t = TestVLARuntime()
     t.test_flow_matching_infer()
     t.test_autoregressive_infer()
@@ -378,12 +648,15 @@ if __name__ == "__main__":
     print("  ✓ VLA全部通过")
 
     # VLM
-    print("\n[3/3] VLM推理测试...")
+    print("\n[4/4] VLM推理测试...")
     t = TestVLMRuntime()
     t.test_single_turn_text_only()
     t.test_single_turn_with_image()
     t.test_multi_turn_session()
     t.test_session_reset()
+    t.test_prefix_cache_hit()
+    t.test_prefix_cache_skipped_for_image()
+    t.test_prefix_cache_partial_share()
     t.test_temp_session()
     print("  ✓ VLM全部通过")
 

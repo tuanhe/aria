@@ -17,10 +17,14 @@ logging.basicConfig(
 logger = logging.getLogger("aria.cli")
 
 
-def _build_executor(name: str):
+def _build_executor(name: str, cfg=None):
     from aria.backends import build_executor
     if name == "mock":
         return build_executor("mock", latency_ms=5.0)
+    if name == "torch":
+        if cfg is None:
+            raise ValueError("torch backend 需要 FrameworkConfig")
+        return build_executor("torch", config=cfg)
     return build_executor(name)
 
 
@@ -31,7 +35,7 @@ def run_vla(config_path: str, executor_name: str = "mock", graph_dir: str = None
     cfg      = FrameworkConfig.from_yaml(config_path)
     if graph_dir:
         cfg.graph_dir = graph_dir
-    executor = _build_executor(executor_name)
+    executor = _build_executor(executor_name, cfg=cfg)
     runtime  = VLARuntime.from_config(cfg, executor)
 
     rng = np.random.default_rng(0)
@@ -64,7 +68,7 @@ def run_vlm(config_path: str, executor_name: str = "mock", graph_dir: str = None
     cfg      = FrameworkConfig.from_yaml(config_path)
     if graph_dir:
         cfg.graph_dir = graph_dir
-    executor = _build_executor(executor_name)
+    executor = _build_executor(executor_name, cfg=cfg)
     runtime  = VLMRuntime.from_config(cfg, executor)
 
     rng   = np.random.default_rng(0)

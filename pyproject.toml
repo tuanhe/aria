@@ -28,6 +28,8 @@ onnx = [
     "onnx>=1.14.0",
     "onnxruntime>=1.16.0",
 ]
+# PyTorch 参考后端：纯 Python，CPU 可跑，用来在没有 NPU 的环境
+# 做实际能算的 debug（特别是验证 KV cache / 前缀缓存语义）。
 torch = [
     "torch>=2.1.0",
 ]

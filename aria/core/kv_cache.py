@@ -121,6 +121,40 @@ class KVCacheManager:
         """返回所有层的有效KV（用于将整块KV作为图输入）"""
         return self._cache[:, :, :, :, :self._valid_len, :]
 
+    def read_range(self, start: int, end: int) -> np.ndarray:
+        """
+        读取 [start, end) 范围的 KV（单 batch 切片），用于写入前缀缓存。
+        返回: [num_layers, 2, num_heads, end-start, head_dim]
+        """
+        assert 0 <= start <= end <= self._valid_len, \
+            f"read_range 越界: [{start},{end}) vs valid_len={self._valid_len}"
+        return self._cache[:, :, 0, :, start:end, :].copy()
+
+    def bulk_load_prefix(self, kv_data: np.ndarray) -> None:
+        """
+        把一段连续的 KV 写入工作区开头（用于前缀缓存命中后回灌）。
+
+        kv_data shape: [num_layers, 2, num_heads, M, head_dim]
+                       M 必须 <= max_seq_len
+
+        写入后 valid_len = history_len = M
+        （前缀视为已成既往的历史，后续 prefill 从 M 起继续写）
+        """
+        assert self._valid_len == 0, \
+            f"bulk_load_prefix 只能在空 Cache 上调用（当前 valid_len={self._valid_len}）"
+        L, two, H, M, D = kv_data.shape
+        assert L  == self.num_layers, f"num_layers 不匹配: {L} vs {self.num_layers}"
+        assert two == 2,              f"K/V 维必须是 2, got {two}"
+        assert H  == self.num_heads,  f"num_heads 不匹配: {H} vs {self.num_heads}"
+        assert D  == self.head_dim,   f"head_dim 不匹配: {D} vs {self.head_dim}"
+        assert M  <= self.max_seq_len, f"前缀长度 {M} > max_seq_len {self.max_seq_len}"
+
+        # 端侧 batch=1：广播到 batch 维（单元素 slice）
+        self._cache[:, :, 0, :, :M, :] = kv_data
+        self._valid_len   = M
+        self._history_len = M
+        logger.debug(f"[ARIA/KVCache] 前缀回灌 M={M}")
+
     # ------------------------------------------------------------------
     # 生命周期管理
     # ------------------------------------------------------------------
