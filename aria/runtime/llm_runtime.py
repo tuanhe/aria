@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 import time
 import uuid
-from typing import Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
 import numpy as np
 
@@ -50,26 +50,53 @@ class LLMRuntime:
         r1    = runtime.generate("第一个问题", session_id=sid)
         r2    = runtime.generate("继续上面的话题", session_id=sid)
         runtime.close_session(sid)
+
+    流式用法：
+        for token_text in runtime.generate_stream("你好"):
+            print(token_text, end="", flush=True)
     """
 
     def __init__(self,
-                 config:   FrameworkConfig,
-                 executor: NPUExecutor):
+                 config:     FrameworkConfig,
+                 executor:   NPUExecutor,
+                 tokenizer:  Any = None):
         assert config.mode == "llm", \
             f"LLMRuntime 需要 mode=llm，当前 mode={config.mode}"
-        self.config    = config
-        self.executor  = executor
+        self.config      = config
+        self.executor    = executor
+        self._tokenizer  = tokenizer   # transformers AutoTokenizer，None 则用 mock
         self._sessions: Dict[str, Session] = {}
-        logger.info("[ARIA/LLM] LLMRuntime 初始化完成")
+        logger.info("[ARIA/LLM] LLMRuntime 初始化完成 tokenizer=%s",
+                    type(tokenizer).__name__ if tokenizer else "mock")
 
     @classmethod
     def from_config(cls,
-                    config:   FrameworkConfig,
-                    executor: Optional[NPUExecutor] = None) -> "LLMRuntime":
+                    config:    FrameworkConfig,
+                    executor:  Optional[NPUExecutor] = None,
+                    tokenizer: Any = None) -> "LLMRuntime":
         if executor is None:
             executor = MockNPUExecutor()
             logger.info("[ARIA/LLM] 使用 MockNPUExecutor")
-        return cls(config, executor)
+        return cls(config, executor, tokenizer=tokenizer)
+
+    # ------------------------------------------------------------------
+    # Tokenizer helpers
+    # ------------------------------------------------------------------
+
+    def _tokenize(self, text: str) -> List[int]:
+        if self._tokenizer is not None:
+            return self._tokenizer.encode(text, add_special_tokens=False)
+        return _mock_tokenize(text)
+
+    def _detokenize(self, ids: List[int]) -> str:
+        if self._tokenizer is not None:
+            return self._tokenizer.decode(ids, skip_special_tokens=True)
+        return _mock_detokenize(ids)
+
+    def _detokenize_token(self, token_id: int) -> str:
+        if self._tokenizer is not None:
+            return self._tokenizer.decode([token_id], skip_special_tokens=True)
+        return _mock_detokenize([token_id])
 
     # ------------------------------------------------------------------
     # Session 管理
@@ -100,16 +127,14 @@ class LLMRuntime:
     # 主推理接口
     # ------------------------------------------------------------------
 
-    def generate(self,
-                 prompt:     str,
-                 session_id: Optional[str] = None) -> str:
+    def generate_stream(self,
+                        prompt:     str,
+                        session_id: Optional[str] = None) -> Iterator[str]:
         """
-        文本生成。
+        流式文本生成，逐 token yield 解码后的文本片段。
 
         prompt:     本轮输入（不含历史，历史在 KV Cache 里）
         session_id: 多轮时传入，None 则新建临时 session
-
-        返回: 生成的文本字符串
         """
         t0      = time.perf_counter()
         is_temp = session_id is None
@@ -119,35 +144,48 @@ class LLMRuntime:
 
         llm = LLMBackbone(self.config, self.executor, session.kv_cache)
 
-        # tokenize
-        token_ids = _mock_tokenize(prompt)
+        token_ids = self._tokenize(prompt)
         if not session.can_accept_tokens(len(token_ids)):
+            if is_temp:
+                self.close_session(session_id)
             raise RuntimeError(
                 f"KV Cache 不足: 当前={session.current_kv_len} "
                 f"新增={len(token_ids)} 最大={self.config.llm.max_seq_len}"
             )
 
-        # prefill → 直接得到 logits（llm 模式）
         first_logits = llm.prefill(
             token_ids    = np.array(token_ids, dtype=np.int32),
             kv_start_pos = session.history_kv_len,
-        )  # [vocab_size] float32
+        )
 
-        # decode loop
-        decoder  = TextDecoder(self.config, llm)
-        gen_ids  = decoder.decode(first_logits)
-        response = _mock_detokenize(gen_ids)
+        decoder = TextDecoder(self.config, llm)
+        gen_ids: List[int] = []
+        for token_id in decoder.decode_stream(first_logits):
+            gen_ids.append(token_id)
+            yield self._detokenize_token(token_id)
 
+        response = self._detokenize(gen_ids)
         session.add_user_turn({"role": "user", "content": prompt}, token_ids)
         session.add_assistant_turn(response, gen_ids)
 
         elapsed = (time.perf_counter() - t0) * 1000
         logger.info(
-            "[ARIA/LLM] generate 完成 session=%s elapsed=%.1fms tokens=%d",
+            "[ARIA/LLM] generate_stream 完成 session=%s elapsed=%.1fms tokens=%d",
             session_id, elapsed, len(gen_ids),
         )
 
         if is_temp:
             self.close_session(session_id)
 
-        return response
+    def generate(self,
+                 prompt:     str,
+                 session_id: Optional[str] = None) -> str:
+        """
+        文本生成（非流式，收集 generate_stream 的所有输出后返回）。
+
+        prompt:     本轮输入（不含历史，历史在 KV Cache 里）
+        session_id: 多轮时传入，None 则新建临时 session
+
+        返回: 生成的文本字符串
+        """
+        return "".join(self.generate_stream(prompt, session_id))

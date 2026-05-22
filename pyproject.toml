@@ -55,11 +55,19 @@ ort = [
     "onnx>=1.14.0",
     "onnxruntime>=1.16.0",
 ]
+# OpenAI 兼容推理服务依赖
+serve = [
+    "fastapi>=0.100.0",
+    "uvicorn[standard]>=0.24.0",
+    "pydantic>=2.0.0",
+    "transformers>=4.40.0",
+]
 
 [project.scripts]
 aria        = "aria.cli:main"
 aria-build  = "tools.build_engines:main"
 aria-export = "tools.export_hf:main"
+aria-serve  = "aria.serve.server:main"
 
 [project.urls]
 Homepage = "https://github.com/"

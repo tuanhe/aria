@@ -8,7 +8,7 @@ models/text_decoder.py
 from __future__ import annotations
 
 import logging
-from typing import List, Optional
+from typing import Iterator, List, Optional
 
 import numpy as np
 
@@ -64,6 +64,20 @@ class TextDecoder:
             logger.debug(f"[ARIA/Text] step={step} token={token_id}")
 
         return generated
+
+    def decode_stream(self, first_token_logits: np.ndarray) -> Iterator[int]:
+        """
+        同 decode()，但逐 token yield，供流式输出使用。
+        """
+        logits = first_token_logits
+        for step in range(self.tcfg.max_new_tokens):
+            token_id = self._sample(logits)
+            if token_id in self.tcfg.eos_token_ids:
+                logger.debug("[ARIA/Text] 遇到EOS，步数=%d", step)
+                return
+            yield token_id
+            logits = self.backbone.decode_step(token_id)
+            logger.debug("[ARIA/Text] step=%d token=%d", step, token_id)
 
     # ------------------------------------------------------------------
     # 采样策略
