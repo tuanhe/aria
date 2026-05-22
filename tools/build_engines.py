@@ -22,6 +22,7 @@ tools/build_engines.py
 from __future__ import annotations
 
 import argparse
+import contextlib
 import logging
 import os
 import sys
@@ -255,23 +256,80 @@ def _build_from_onnx(
     backend_build,
     opts:          Dict[str, Any],
 ) -> None:
-    """真实 ONNX 模式：直接拿 aria-export 产出的 .onnx 文件编译。"""
+    """
+    真实 ONNX 模式：把 aria-export 产出的 lean ONNX 编译为 NPU 产物。
+
+    aria-export 产出的 .onnx 是"瘦身版"：权重数据在 weights.bin 里，
+    ONNX initializer 只有外部引用。NPU 编译器（TRT / QNN / RKNN 等）的
+    ONNX 解析器默认不加载 external data，直接传过去会得到空权重。
+
+    因此每张图编译前先 rehydrate：把 weights.bin 重新嵌回 ONNX，
+    写到临时文件交给编译器，编译完即删除。
+    峰值磁盘 = weights.bin（一份）+ 当前图临时 fat ONNX（一份）。
+    """
     missing = []
     for meta in metas:
-        onnx_path = os.path.join(onnx_dir, f"{meta.name}.onnx")
-        if not os.path.exists(onnx_path):
-            logger.warning("找不到 %s，跳过", onnx_path)
+        lean_path = os.path.join(onnx_dir, f"{meta.name}.onnx")
+        if not os.path.exists(lean_path):
+            logger.warning("找不到 %s，跳过", lean_path)
             missing.append(meta.name)
             continue
 
         out_path = str(out_dir / f"{meta.name}.bin")
-        logger.info("== %s ==  (真实权重)", meta.name)
-        logger.info("  onnx: %s  (%.1f MiB)",
-                    onnx_path, os.path.getsize(onnx_path) / 1024 / 1024)
-        backend_build(onnx_path, out_path, meta, opts)
+        logger.info("== %s ==", meta.name)
+
+        with _rehydrated_onnx(lean_path, onnx_dir) as fat_path:
+            logger.info("  onnx: %s  (%.1f MiB)",
+                        fat_path, os.path.getsize(fat_path) / 1024 / 1024)
+            backend_build(fat_path, out_path, meta, opts)
 
     if missing:
         logger.warning("以下图在 --onnx 目录中缺失，已跳过: %s", missing)
+
+
+@contextlib.contextmanager
+def _rehydrated_onnx(lean_path: str, data_dir: str):
+    """
+    context manager：把 lean ONNX（external data 引用）还原成带完整权重的
+    临时 ONNX 文件，退出时自动删除。
+
+    如果该 ONNX 本身已经是自包含（无 external data），直接 yield 原路径，
+    不产生临时文件。
+    """
+    try:
+        import onnx
+    except ImportError:
+        # onnx 未装，只能直接传原路径，让编译器自己处理
+        logger.warning("[rehydrate] onnx 未安装，直接传入 lean ONNX（可能报错）")
+        yield lean_path
+        return
+
+    model = onnx.load(lean_path, load_external_data=False)
+
+    has_external = any(
+        init.data_location == onnx.TensorProto.EXTERNAL
+        for init in model.graph.initializer
+    )
+
+    if not has_external:
+        yield lean_path
+        return
+
+    # 加载时让 onnx 自动解析 external data（需要 data_dir 在同一目录）
+    model = onnx.load(lean_path, load_external_data=True)
+
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix=".onnx", prefix="aria_fat_")
+    os.close(tmp_fd)
+    try:
+        onnx.save(model, tmp_path)
+        logger.info("  rehydrate → %s (%.1f MiB)",
+                    os.path.basename(tmp_path),
+                    os.path.getsize(tmp_path) / 1024 / 1024)
+        yield tmp_path
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+            logger.debug("  删除临时文件 %s", tmp_path)
 
 
 def _build_from_dummy(
