@@ -1,20 +1,22 @@
 """
-aria/tools/build_dummy_engines.py
+tools/build_engines.py
 
-读 yaml 配置 → 实例化各个模型构件 → 把它们 register_graph 的所有
-GraphMeta 收集起来 → 为每张图生成 trivial PyTorch nn.Module
-（输入/输出 shape & dtype 与 GraphMeta 声明完全一致）→ 导出 ONNX
-→ 调用 backend 的 build() 编译成对应产物（TRT 的 .engine、
-QNN 的 .bin / .so 等）。
+把 ONNX 编译为 NPU 后端可执行文件（aria-build CLI 入口）。
 
-这一层是 **后端无关** 的：harvest + ONNX 生成对所有后端一样，
-真正后端专属的编译逻辑住在 aria/backends/<name>/build.py 里。
-
-权重是随机的，**产物不能用于真实推理**，只用作 mock 替代。
+支持两种模式：
+  真实模式   --onnx <dir>  接收 aria-export 产出的 .onnx 文件
+  Dummy 模式 （不加 --onnx）生成随机权重 ONNX 再编译，产物不可推理
 
 用法：
+    # 真实模式（接 aria-export 输出）
+    aria-build --config configs/vlm_qwen3.yaml --out compiled/qwen3 \\
+               --onnx onnx_exports/qwen3 --backend trt
+
+    # Dummy 模式（测试用）
     aria-build --config configs/vla_demo_orin.yaml --out compiled/demo \\
-               [--backend trt] [--use-dla] [--no-fp16]
+               --backend trt [--use-dla] [--no-fp16]
+
+后端专属编译逻辑在 tools/backends/<name>/build.py。
 """
 
 from __future__ import annotations
@@ -25,11 +27,11 @@ import os
 import sys
 import tempfile
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 
-from aria.backends import get_builder, list_builders
+from tools.backends import get_builder, list_builders
 from aria.core.executor import GraphMeta, NPUExecutor
 from aria.models.base import FrameworkConfig
 
@@ -243,58 +245,50 @@ def export_onnx(meta: GraphMeta,
 
 
 # ---------------------------------------------------------------------------
-# main
+# 两条编译路径
 # ---------------------------------------------------------------------------
 
-def main(argv=None):
-    parser = argparse.ArgumentParser(prog="aria-build")
-    parser.add_argument("--config",   required=True,
-                        help="yaml 配置（决定 bucket / 维度等）")
-    parser.add_argument("--out",      required=True,
-                        help="engine 输出目录（每张图一个 .bin 文件）")
-    parser.add_argument("--backend",  default="trt",
-                        choices=list_builders(),
-                        help="编译后端")
-    parser.add_argument("--use-dla",  action="store_true",
-                        help="(TRT) 尝试把支持的层下到 Orin DLA core")
-    parser.add_argument("--dla-core", type=int, default=0)
-    parser.add_argument("--no-fp16",  action="store_true",
-                        help="禁用 FP16（默认开）")
-    parser.add_argument("--workspace-mib", type=int, default=1024)
-    parser.add_argument("--verbose",  action="store_true")
-    args = parser.parse_args(argv)
+def _build_from_onnx(
+    metas:         List[GraphMeta],
+    onnx_dir:      str,
+    out_dir:       Path,
+    backend_build,
+    opts:          Dict[str, Any],
+) -> None:
+    """真实 ONNX 模式：直接拿 aria-export 产出的 .onnx 文件编译。"""
+    missing = []
+    for meta in metas:
+        onnx_path = os.path.join(onnx_dir, f"{meta.name}.onnx")
+        if not os.path.exists(onnx_path):
+            logger.warning("找不到 %s，跳过", onnx_path)
+            missing.append(meta.name)
+            continue
 
-    logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s [%(name)s] %(levelname)s %(message)s")
+        out_path = str(out_dir / f"{meta.name}.bin")
+        logger.info("== %s ==  (真实权重)", meta.name)
+        logger.info("  onnx: %s  (%.1f MiB)",
+                    onnx_path, os.path.getsize(onnx_path) / 1024 / 1024)
+        backend_build(onnx_path, out_path, meta, opts)
 
-    cfg = FrameworkConfig.from_yaml(args.config)
-    out_dir = Path(args.out).resolve()
-    out_dir.mkdir(parents=True, exist_ok=True)
+    if missing:
+        logger.warning("以下图在 --onnx 目录中缺失，已跳过: %s", missing)
 
-    metas = harvest_graphs(cfg)
-    logger.info("待构建图数量: %d   (backend=%s)", len(metas), args.backend)
 
-    backend_build = get_builder(args.backend)
-    opts = {
-        "fp16":           not args.no_fp16,
-        "use_dla":        args.use_dla,
-        "dla_core":       args.dla_core,
-        "workspace_mib":  args.workspace_mib,
-        "verbose":        args.verbose,
-        # ORT 后端会用到：剥共享权重时写到 out_dir/shared_weights.npz
-        "weights_npz":    str(out_dir / "shared_weights.npz"),
-    }
-
+def _build_from_dummy(
+    metas:         List[GraphMeta],
+    cfg:           "FrameworkConfig",
+    out_dir:       Path,
+    backend_build,
+    opts:          Dict[str, Any],
+) -> None:
+    """Dummy 模式：用随机权重生成 ONNX 再编译（用于测试，产物不可推理）。"""
     with tempfile.TemporaryDirectory(prefix="aria_onnx_") as tmp:
         for meta in metas:
             onnx_path = os.path.join(tmp, f"{meta.name}.onnx")
-            # 上层 model 代码硬编码 .bin 扩展名，所有后端统一用 .bin
-            # 内容可以是 .engine / 剥过权重的 .onnx / .rknn 等等
             out_path  = str(out_dir / f"{meta.name}.bin")
+            shared    = _shared_params_for(meta.name, cfg)
 
-            shared = _shared_params_for(meta.name, cfg)
-
-            logger.info("== %s ==", meta.name)
+            logger.info("== %s ==  (dummy 权重)", meta.name)
             logger.info("  inputs:  %s", dict(meta.input_shapes))
             logger.info("  outputs: %s", dict(meta.output_shapes))
             if shared:
@@ -302,6 +296,62 @@ def main(argv=None):
 
             export_onnx(meta, onnx_path, shared)
             backend_build(onnx_path, out_path, meta, opts)
+
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        prog        = "aria-build",
+        description = "把 ONNX 编译为 NPU 后端可执行文件（.bin）",
+    )
+    parser.add_argument("--config",  required=True,
+                        help="yaml 配置（决定 bucket / 维度等）")
+    parser.add_argument("--out",     required=True,
+                        help="engine 输出目录（每张图一个 .bin 文件）")
+    parser.add_argument("--onnx",    default=None, metavar="DIR",
+                        help="真实 ONNX 目录（来自 aria-export）；"
+                             "省略则自动生成随机权重的 dummy ONNX")
+    parser.add_argument("--backend", default="trt",
+                        choices=list_builders(),
+                        help="编译后端")
+    parser.add_argument("--use-dla", action="store_true",
+                        help="(TRT) 尝试把支持的层下到 Orin DLA core")
+    parser.add_argument("--dla-core",      type=int, default=0)
+    parser.add_argument("--no-fp16",       action="store_true",
+                        help="禁用 FP16（默认开）")
+    parser.add_argument("--workspace-mib", type=int, default=1024)
+    parser.add_argument("--verbose",       action="store_true")
+    args = parser.parse_args(argv)
+
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s [%(name)s] %(levelname)s %(message)s")
+
+    cfg     = FrameworkConfig.from_yaml(args.config)
+    out_dir = Path(args.out).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    metas = harvest_graphs(cfg)
+    mode  = f"真实 ONNX ({args.onnx})" if args.onnx else "dummy"
+    logger.info("待构建图数量: %d   backend=%s   模式=%s",
+                len(metas), args.backend, mode)
+
+    backend_build = get_builder(args.backend)
+    opts = {
+        "fp16":          not args.no_fp16,
+        "use_dla":       args.use_dla,
+        "dla_core":      args.dla_core,
+        "workspace_mib": args.workspace_mib,
+        "verbose":       args.verbose,
+        "weights_npz":   str(out_dir / "shared_weights.npz"),
+    }
+
+    if args.onnx:
+        _build_from_onnx(metas, args.onnx, out_dir, backend_build, opts)
+    else:
+        _build_from_dummy(metas, cfg, out_dir, backend_build, opts)
 
     logger.info("全部产物已写入 %s", out_dir)
 

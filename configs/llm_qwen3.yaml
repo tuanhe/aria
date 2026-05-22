@@ -1,0 +1,24 @@
+mode: llm
+graph_dir: compiled/qwen3_llm
+
+llm:
+  num_layers: 28
+  hidden_dim: 3584
+  num_heads: 8          # Qwen3-7B KV heads（GQA，非 Q heads 28）
+  head_dim: 128
+  vocab_size: 152064
+  prefill_buckets: [512, 1024, 2048]
+  decode_buckets:  [512, 1024, 2048]
+  max_seq_len: 4096
+
+text:
+  max_new_tokens: 512
+  do_sample: true
+  temperature: 0.7
+  top_p: 0.9
+  eos_token_ids: [151645, 151643]
+
+max_batch: 1
+pad_token_id: 0
+bos_token_id: 151643
+eos_token_id: 151645

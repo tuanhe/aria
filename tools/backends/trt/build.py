@@ -1,18 +1,14 @@
 """
-aria/backends/trt/build.py
+tools/backends/trt/build.py
 
-把 ONNX 编译成 TensorRT .engine。函数签名遵循所有后端共用的约定：
+把 ONNX 编译成 TensorRT .engine。
 
-    build(onnx_path, out_path, meta, opts) -> dict
-
-opts 是后端专属选项字典：
+opts:
     fp16:          bool  默认 True
-    use_dla:       bool  默认 False，True 时优先把支持层下到 DLA
+    use_dla:       bool  默认 False
     dla_core:      int   默认 0
     workspace_mib: int   默认 1024
     verbose:       bool  默认 False
-
-返回 dict 包含 {"backend": "DLA0+GPU"|"GPU", "bytes": N}，方便上层打日志。
 """
 
 from __future__ import annotations
@@ -33,7 +29,6 @@ def _build_one(onnx_path: str,
                dla_core: int,
                workspace_mib: int,
                verbose: bool):
-    """单次构建尝试，失败返回 (None, _)。"""
     import tensorrt as trt
 
     trt_logger = trt.Logger(trt.Logger.VERBOSE if verbose else trt.Logger.ERROR)

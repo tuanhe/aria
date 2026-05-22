@@ -50,41 +50,48 @@ class LLMBackbone:
     # ------------------------------------------------------------------
 
     def _register_prefill_graphs(self) -> None:
+        is_llm = self.config.mode == "llm"
         for seq_len in self.lcfg.prefill_buckets:
             name = f"prefill_{seq_len}"
+
+            input_shapes: Dict = {
+                "input_ids":      (self.config.max_batch, seq_len),
+                "attention_mask": (self.config.max_batch, seq_len),
+                "position_ids":   (self.config.max_batch, seq_len),
+                "kv_start_pos":   (1,),
+            }
+            if not is_llm:
+                input_shapes["vision_feat"] = (
+                    self.config.max_batch,
+                    self.vcfg.total_vision_tokens,
+                    self.vcfg.feat_dim,
+                )
+
+            kv_shape = (
+                self.lcfg.num_layers * 2,
+                self.config.max_batch,
+                self.lcfg.num_heads,
+                seq_len,
+                self.lcfg.head_dim,
+            )
+            if is_llm:
+                output_shapes  = {"logits": (self.config.max_batch, self.lcfg.vocab_size),
+                                   "kv_out": kv_shape}
+                output_dtypes  = {"logits": np.float32, "kv_out": np.float16}
+            else:
+                output_shapes  = {"last_hidden": (self.config.max_batch, self.lcfg.hidden_dim),
+                                   "kv_out": kv_shape}
+                output_dtypes  = {"last_hidden": np.float16, "kv_out": np.float16}
+
             meta = GraphMeta(
-                name  = name,
-                path  = f"{self.config.graph_dir}/{name}.bin",
-                input_shapes = {
-                    "input_ids":      (self.config.max_batch, seq_len),
-                    "vision_feat":    (self.config.max_batch,
-                                       self.vcfg.total_vision_tokens,
-                                       self.vcfg.feat_dim),
-                    "attention_mask": (self.config.max_batch, seq_len),
-                    "position_ids":   (self.config.max_batch, seq_len),
-                    # kv_start_pos：告诉模型从哪个位置写KV Cache（多轮用）
-                    "kv_start_pos":   (1,),
-                },
-                output_shapes = {
-                    # last_hidden：最后一个真实token的隐状态，给动作头/文本头用
-                    "last_hidden": (self.config.max_batch, self.lcfg.hidden_dim),
-                    # 每层KV Cache输出（Prefill后写入KVCacheManager）
-                    # 展平为 [num_layers * 2, batch, heads, seq_len, head_dim]
-                    "kv_out": (
-                        self.lcfg.num_layers * 2,
-                        self.config.max_batch,
-                        self.lcfg.num_heads,
-                        seq_len,
-                        self.lcfg.head_dim,
-                    ),
-                },
-                output_dtypes = {
-                    "last_hidden": np.float16,
-                    "kv_out":      np.float16,
-                },
+                name          = name,
+                path          = f"{self.config.graph_dir}/{name}.bin",
+                input_shapes  = input_shapes,
+                output_shapes = output_shapes,
+                output_dtypes = output_dtypes,
             )
             self.executor.register_graph(meta)
-        logger.info(f"[ARIA/LLM] 注册Prefill图: {self.lcfg.prefill_buckets}")
+        logger.info(f"[ARIA/LLM] 注册Prefill图: {self.lcfg.prefill_buckets} (mode={self.config.mode})")
 
     def _register_decode_graphs(self) -> None:
         """AR模式专用：每个KV Cache长度bucket一张Decode图"""
@@ -128,50 +135,52 @@ class LLMBackbone:
     # ------------------------------------------------------------------
 
     def prefill(self,
-                token_ids:   np.ndarray,
-                vision_feat: np.ndarray,
+                token_ids:    np.ndarray,
+                vision_feat:  Optional[np.ndarray] = None,
                 kv_start_pos: int = 0) -> np.ndarray:
         """
         执行Prefill。
 
-        token_ids:    [seq_len] int32，文本部分的token（视觉token由vision_feat提供）
-        vision_feat:  [1, total_vision_tokens, feat_dim] float16
-        kv_start_pos: 多轮对话时，历史KV的末尾位置
+        token_ids:    [seq_len] int32
+        vision_feat:  [1, total_vision_tokens, feat_dim] float16，llm 模式传 None
+        kv_start_pos: 多轮对话时历史 KV 的末尾位置
 
-        返回: last_hidden [1, hidden_dim] float16
+        返回:
+          llm 模式  → logits [vocab_size] float32
+          vlm/vla   → last_hidden [1, hidden_dim] float16
         """
-        actual_len = len(token_ids) + self.vcfg.total_vision_tokens
-        total_len  = kv_start_pos + actual_len
+        is_llm     = self.config.mode == "llm"
+        vis_tokens = 0 if is_llm else self.vcfg.total_vision_tokens
+        actual_len = len(token_ids) + vis_tokens
 
         bucket, padded_ids, attn_mask, pos_ids = self._pad_prefill_input(
             token_ids, actual_len, kv_start_pos
         )
 
-        out = self.executor.run(
-            f"prefill_{bucket}",
-            {
-                "input_ids":      padded_ids[np.newaxis, :],        # [1, bucket]
-                "vision_feat":    vision_feat,                       # [1, vis_tok, feat]
-                "attention_mask": attn_mask[np.newaxis, :],         # [1, bucket]
-                "position_ids":   pos_ids[np.newaxis, :],           # [1, bucket]
-                "kv_start_pos":   np.array([kv_start_pos], dtype=np.int32),
-            }
-        )
+        inputs = {
+            "input_ids":      padded_ids[np.newaxis, :],
+            "attention_mask": attn_mask[np.newaxis, :],
+            "position_ids":   pos_ids[np.newaxis, :],
+            "kv_start_pos":   np.array([kv_start_pos], dtype=np.int32),
+        }
+        if not is_llm:
+            inputs["vision_feat"] = vision_feat
 
-        # 将Prefill输出的KV写入KVCacheManager
-        # kv_out shape: [num_layers*2, batch, heads, seq_len, head_dim]
-        kv_out    = out["kv_out"]
-        num_layers = self.lcfg.num_layers
-        for layer_idx in range(num_layers):
+        out = self.executor.run(f"prefill_{bucket}", inputs)
+
+        kv_out = out["kv_out"]
+        for layer_idx in range(self.lcfg.num_layers):
             k = kv_out[layer_idx * 2,     :, :, :actual_len, :]
             v = kv_out[layer_idx * 2 + 1, :, :, :actual_len, :]
             self.kv_cache.write_prefill(layer_idx, k, v, start_pos=kv_start_pos)
 
         logger.debug(
-            f"[ARIA/LLM] Prefill完成: bucket={bucket} "
-            f"actual_len={actual_len} kv_start={kv_start_pos}"
+            "[ARIA/LLM] Prefill完成: bucket=%d actual_len=%d kv_start=%d",
+            bucket, actual_len, kv_start_pos,
         )
-        return out["last_hidden"]  # [1, hidden_dim]
+        if is_llm:
+            return out["logits"][0]    # [vocab_size] float32
+        return out["last_hidden"]      # [1, hidden_dim] float16
 
     # ------------------------------------------------------------------
     # Decode（AR模式）

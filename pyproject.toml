@@ -33,6 +33,13 @@ onnx = [
 torch = [
     "torch>=2.1.0",
 ]
+# HuggingFace → ONNX 导出工具链（离线转换，不随运行时部署）。
+export = [
+    "torch>=2.2.0",
+    "transformers>=4.40.0",
+    "onnx>=1.14.0",
+    "safetensors>=0.4.0",
+]
 dev = [
     "pytest>=7.0.0",
 ]
@@ -50,12 +57,13 @@ ort = [
 ]
 
 [project.scripts]
-aria       = "aria.cli:main"
-aria-build = "aria.tools.build_dummy_engines:main"
+aria        = "aria.cli:main"
+aria-build  = "tools.build_engines:main"
+aria-export = "tools.export_hf:main"
 
 [project.urls]
 Homepage = "https://github.com/"
 
 [tool.setuptools.packages.find]
-include = ["aria*"]
+include = ["aria*", "tools*"]
 exclude = ["tests*", "configs*"]
