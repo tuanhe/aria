@@ -21,7 +21,7 @@ _EXECUTORS: Dict[str, Tuple[str, str]] = {
     "trt":   ("aria.backends.trt.executor",   "TensorRTExecutor"),
     "ort":   ("aria.backends.ort.executor",   "ORTExecutor"),
     "torch": ("aria.backends.torch.executor", "TorchExecutor"),
-    # "qnn":  ("aria.backends.qnn.executor",  "QnnExecutor"),
+    "qnn":  ("aria.backends.qnn.executor",  "QnnExecutor"),
     # "rknn": ("aria.backends.rknn.executor", "RKNNExecutor"),
     # "cann": ("aria.backends.cann.executor", "CANNExecutor"),
 }

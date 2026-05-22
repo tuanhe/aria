@@ -18,7 +18,7 @@ from typing import Callable, Dict, List, Tuple
 _BUILDERS: Dict[str, Tuple[str, str]] = {
     "trt": ("tools.backends.trt.build", "build"),
     "ort": ("tools.backends.ort.build", "build"),
-    # "qnn":  ("tools.backends.qnn.build",  "build"),
+    "qnn":  ("tools.backends.qnn.build",  "build"),
     # "rknn": ("tools.backends.rknn.build", "build"),
 }
 
