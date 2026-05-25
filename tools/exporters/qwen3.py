@@ -36,6 +36,7 @@ Qwen3 GQA：kv_heads = model.config.num_key_value_heads。
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from pathlib import Path
 from typing import List, Tuple
@@ -116,8 +117,9 @@ class _PrefillWrapper(nn.Module):
         last_hidden = torch.einsum("bsh,s->bh", hidden, one_hot)       # [1, hidden_dim]
 
         # 5. 展平 KV cache → [L*2, 1, kv_heads, seq_len, head_dim]
-        k_list: List[torch.Tensor] = pkv.key_cache    # List[Tensor [1, kv_heads, S, head_dim]]
-        v_list: List[torch.Tensor] = pkv.value_cache
+        # transformers ≥4.51: DynamicCache 用 layers[i].keys / .values，不再有 key_cache/value_cache 列表
+        k_list: List[torch.Tensor] = [ly.keys   for ly in pkv.layers]  # List[Tensor [1, kv_heads, S, head_dim]]
+        v_list: List[torch.Tensor] = [ly.values for ly in pkv.layers]
         k_stack = torch.stack(k_list, dim=0)           # [L, 1, kv_heads, S, head_dim]
         v_stack = torch.stack(v_list, dim=0)
         # 交错排列：k0, v0, k1, v1, ...
@@ -165,8 +167,8 @@ class _LLMPrefillWrapper(nn.Module):
         last_h  = torch.einsum("bsh,s->bh", hidden, one_hot)      # [1, hidden_dim]
         logits  = self._lm_head(last_h)                            # [1, vocab_size]
 
-        k_list: List[torch.Tensor] = pkv.key_cache
-        v_list: List[torch.Tensor] = pkv.value_cache
+        k_list: List[torch.Tensor] = [ly.keys   for ly in pkv.layers]
+        v_list: List[torch.Tensor] = [ly.values for ly in pkv.layers]
         k_stack = torch.stack(k_list, dim=0)
         v_stack = torch.stack(v_list, dim=0)
         kv_out  = torch.stack([k_stack, v_stack], dim=1).reshape(
@@ -199,11 +201,9 @@ class _DecodeWrapper(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         from transformers import DynamicCache
 
-        # 重建 DynamicCache
-        cache = DynamicCache()
-        for i in range(self._n_layers):
-            cache.key_cache.append(kv_in[i * 2])
-            cache.value_cache.append(kv_in[i * 2 + 1])
+        # 重建 DynamicCache（transformers ≥4.51 API：用 from_legacy_cache 构造）
+        past = [(kv_in[i * 2], kv_in[i * 2 + 1]) for i in range(self._n_layers)]
+        cache = DynamicCache.from_legacy_cache(past)
 
         out = self._inner(
             input_ids        = input_id,
@@ -218,8 +218,8 @@ class _DecodeWrapper(nn.Module):
         pkv_new = out.past_key_values                # DynamicCache, seq len = kv_len + 1
 
         # 只取新增的最后 1 个 token 的 KV
-        k_list: List[torch.Tensor] = pkv_new.key_cache
-        v_list: List[torch.Tensor] = pkv_new.value_cache
+        k_list: List[torch.Tensor] = [ly.keys   for ly in pkv_new.layers]
+        v_list: List[torch.Tensor] = [ly.values for ly in pkv_new.layers]
         k_new = torch.stack([k[:, :, -1:, :] for k in k_list], dim=0)  # [L, 1, kv_heads, 1, d]
         v_new = torch.stack([v[:, :, -1:, :] for v in v_list], dim=0)
         kv_new = torch.stack([k_new, v_new], dim=1).reshape(
@@ -237,11 +237,15 @@ class Qwen3Exporter(BaseExporter):
 
     def load_model(self) -> None:
         from transformers import AutoModelForCausalLM
+        # attn_implementation="eager" 绕开 transformers ≥4.50 在 SDPA 路径下
+        # 用 torch.vmap 构造 causal mask 的代码 —— 老 onnx tracer 无法处理 vmap，
+        # 会抛 "RuntimeError: _Map_base::at"。
         self._model = AutoModelForCausalLM.from_pretrained(
             self.model_path,
-            torch_dtype  = torch.float16,
-            device_map   = "cpu",
+            torch_dtype       = torch.float16,
+            device_map        = "cpu",
             trust_remote_code = True,
+            attn_implementation = "eager",
         ).eval()
         logger.info(
             "[Qwen3] 模型加载完毕  layers=%d  hidden=%d  kv_heads=%d",
@@ -261,7 +265,12 @@ class Qwen3Exporter(BaseExporter):
         vcfg         = self.cfg.vision
         is_llm       = self.cfg.mode == "llm"
         num_kv_heads = self._model.config.num_key_value_heads
-        head_dim     = self._model.config.hidden_size // self._model.config.num_attention_heads
+        # Qwen3 把 head_dim 和 hidden_size 解耦（0.6B: hidden=1024, q_heads=16, head_dim=128），
+        # 不能用 hidden_size // num_heads 推导
+        head_dim     = getattr(
+            self._model.config, "head_dim",
+            self._model.config.hidden_size // self._model.config.num_attention_heads,
+        )
 
         if is_llm:
             wrapper = _LLMPrefillWrapper(self._model).eval()
@@ -331,7 +340,10 @@ class Qwen3Exporter(BaseExporter):
         lcfg      = cfg.llm
 
         num_kv_heads = self._model.config.num_key_value_heads
-        head_dim     = self._model.config.hidden_size // self._model.config.num_attention_heads
+        head_dim     = getattr(
+            self._model.config, "head_dim",
+            self._model.config.hidden_size // self._model.config.num_attention_heads,
+        )
 
         wrapper = _DecodeWrapper(
             hf_model   = self._model,
@@ -377,6 +389,62 @@ class Qwen3Exporter(BaseExporter):
 # 工具函数
 # ---------------------------------------------------------------------------
 
+@contextlib.contextmanager
+def _patch_mask_vmap_for_tracing():
+    """
+    transformers ≥4.50 在 create_causal_mask 里用两条不兼容 onnx tracer 的机制：
+      1. torch.vmap 构造 4D mask；
+      2. `TransformGetItemToIndex` 上下文管理器把 `tensor[i, j]` hook 成
+         `_trace_wrapped_higher_order_op`（dynamo HOP），用于 padding mask 索引。
+
+    老 onnx tracer dispatch 不了 vmap / HOP，C++ 层抛 "_Map_base::at"。
+
+    解决方案：
+      - 强制走 `sdpa_mask_older_torch` 路径：它不进 TransformGetItemToIndex
+        上下文，padding mask 用普通张量外乘合并；
+      - 把 `_vmap_for_bhqkv` 替换成纯 broadcasting 等价版本（同时支持
+        bh_indices=True/False 两种调用形态）。
+    """
+    try:
+        import transformers.masking_utils as mu
+    except ImportError:
+        yield
+        return
+
+    saved = {}
+
+    if hasattr(mu, "sdpa_mask") and hasattr(mu, "sdpa_mask_older_torch"):
+        saved["sdpa_mask"] = mu.sdpa_mask
+        mu.sdpa_mask = mu.sdpa_mask_older_torch
+
+    if hasattr(mu, "_vmap_for_bhqkv"):
+        saved["_vmap_for_bhqkv"] = mu._vmap_for_bhqkv
+
+        def _broadcast_for_bhqkv(mask_function, bh_indices=True):
+            def fn(batch_arange, head_arange, q_arange, kv_arange):
+                if bh_indices:
+                    b = batch_arange.view(-1, 1, 1, 1)
+                    h = head_arange.view(1, -1, 1, 1)
+                    q = q_arange.view(1, 1, -1, 1)
+                    k = kv_arange.view(1, 1, 1, -1)
+                else:
+                    # 旧路径：不在 b/h 维度上 vmap，只返回 [Q, K]
+                    b = None
+                    h = None
+                    q = q_arange.view(-1, 1)
+                    k = kv_arange.view(1, -1)
+                return mask_function(b, h, q, k)
+            return fn
+
+        mu._vmap_for_bhqkv = _broadcast_for_bhqkv
+
+    try:
+        yield
+    finally:
+        for name, value in saved.items():
+            setattr(mu, name, value)
+
+
 def _export_onnx(
     wrapper,
     dummy_inputs,
@@ -386,7 +454,7 @@ def _export_onnx(
     dynamic_axes,
 ) -> None:
     Path(onnx_path).parent.mkdir(parents=True, exist_ok=True)
-    with torch.no_grad():
+    with torch.no_grad(), _patch_mask_vmap_for_tracing():
         torch.onnx.export(
             wrapper,
             dummy_inputs,
