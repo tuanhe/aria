@@ -119,3 +119,19 @@ class QnnExecutor(NPUExecutor):
     def _d2h(self, addr: int, shape: tuple, dtype: np.dtype) -> np.ndarray:
         """HTP → Host 数据拷贝。"""
         raise NotImplementedError("QNN _d2h 尚未实现")
+
+    def _write_kv_seq(self, addr, buffer_shape, dtype, start, block, plane0=0) -> None:
+        """
+        把 decode 单步的 KV 跨步写回常驻 buffer 第 start 行（方案 B）。
+
+        实现要点：
+          - buffer 在 alloc_persistent 时拿到一块 HTP DDR 地址，并 bind 为
+            decode 图的 kv_cache 输入；
+          - seq 维在倒数第二轴，写一行 = L*2*heads 个 head_dim 小块的跨步拷贝，
+            用 QnnMem / memcpy 按 stride 搬即可（总量几十 KiB）。
+
+        将来升级方案 A（in-place）时改为：把 decode 图的 kv_new 输出地址也
+        setTensorAddress 到 buffer 第 start 行，由图内 scatter 直接写，
+        本函数可空转。参见 TensorRT-Edge-LLM linearKVCache 的 commitSequenceLength。
+        """
+        raise NotImplementedError("QNN _write_kv_seq 尚未实现")

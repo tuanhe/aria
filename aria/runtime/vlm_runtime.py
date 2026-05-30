@@ -107,6 +107,7 @@ class VLMRuntime:
             head_dim    = self.config.llm.head_dim,
             max_seq_len = self.config.llm.max_seq_len,
             max_batch   = self.config.max_batch,
+            executor    = self.executor,
         )
         self._sessions[session_id] = Session(session_id, kv_cache)
         logger.info(f"[ARIA/VLM] 新建session: {session_id}")

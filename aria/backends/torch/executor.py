@@ -2,7 +2,7 @@
 backends/torch/executor.py
 
 PyTorch 参考执行器。所有 graph 都在同一组 nn.Module 上 forward：
-  - prefill_{N}  / decode_{N}  → TinyLLM
+  - prefill_{N}  / decode（单图，kv_cache 常驻 bind） → TinyLLM
   - vision_encoder              → TinyVisionEncoder
   - flow_head                   → TinyFlowHead
 
@@ -80,7 +80,7 @@ class TorchExecutor(NPUExecutor):
             return self._exec_vision(device_inputs, meta)
         if name.startswith("prefill_"):
             return self._exec_prefill(device_inputs, meta)
-        if name.startswith("decode_"):
+        if name == "decode":
             return self._exec_decode(device_inputs, meta)
         if name == "flow_head":
             return self._exec_flow(device_inputs, meta)
@@ -106,7 +106,21 @@ class TorchExecutor(NPUExecutor):
         return arr.astype(dtype)
 
     def _free_device(self, addr: int) -> None:
+        if addr in self._persistent_addrs:
+            return
         self._mem.pop(addr, None)
+
+    def _write_kv_seq(self, addr, buffer_shape, dtype, start, block, plane0=0) -> None:
+        buf = self._mem.get(addr)
+        if buf is None or tuple(buf.shape) != tuple(buffer_shape):
+            buf = torch.from_numpy(
+                np.zeros(buffer_shape, dtype=dtype)
+            ).to(self._device)
+            self._mem[addr] = buf
+        blk = torch.from_numpy(np.ascontiguousarray(block)).to(buf)
+        p = blk.shape[0]
+        n = blk.shape[3]
+        buf[plane0:plane0 + p, :, :, start:start + n, :] = blk
 
     # ------------------------------------------------------------------
     # 各 graph 实现
@@ -173,7 +187,8 @@ class TorchExecutor(NPUExecutor):
     def _exec_decode(self, device_inputs, meta):
         input_id    = self._mem[device_inputs["input_id"]].long()
         position_id = self._mem[device_inputs["position_id"]].long()
-        kv_in       = self._mem[device_inputs["kv_in"]].float()
+        # kv_cache 是常驻 buffer（bind 输入），全长 max_seq_len，只有 [0,cur_pos) 有效
+        kv_in       = self._mem[device_inputs["kv_cache"]].float()
 
         B = input_id.shape[0]
         L  = self._cfg.llm.num_layers

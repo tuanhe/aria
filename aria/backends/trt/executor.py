@@ -218,7 +218,49 @@ class TensorRTExecutor(NPUExecutor):
         return self._pool.acquire(size)
 
     def _free_device(self, device_addr: int) -> None:
+        # 常驻 buffer（如 decode 的 KV）不退回池子，否则会被下次 acquire 复用而损坏
+        if device_addr in self._persistent_addrs:
+            return
         self._pool.release(device_addr)
+
+    def _write_kv_seq(self, device_addr, buffer_shape, dtype, start, block, plane0=0) -> None:
+        """
+        把 block 跨步写回常驻 KV buffer 的 seq 维 [start, start+n)、plane 维 [plane0, plane0+P)。
+
+        布局 [L*2, B, H, max_seq, D]，C-contiguous：对固定 (plane,b,h)，
+        其 [start:start+n, :] 是一段连续的 n*D 元素，可一次 H2D 拷贝；
+        共 P*B*H 段。每段很小（n*D），总量几十 KiB。
+
+        注：这是通用 stride 拆解；高性能实现可用一个 CUDA kernel 一次写完
+        （参见 TensorRT-Edge-LLM 的 commitSequenceLength）。
+        """
+        cudart = self._cudart
+        dtype  = np.dtype(dtype)
+        isz    = dtype.itemsize
+        _, Bb, Hb, max_seq, Db = buffer_shape
+        P, Bk, Hk, n, Dk = block.shape
+        assert Db == Dk and Bk == Bb and Hk == Hb, \
+            f"[ARIA/TRT] KV 写回 shape 不匹配: block={block.shape} buffer={buffer_shape}"
+
+        blk      = np.ascontiguousarray(block.astype(dtype))
+        src_base = blk.ctypes.data
+        chunk_bytes = n * Dk * isz
+
+        for pp in range(P):
+            for b in range(Bb):
+                for h in range(Hb):
+                    dst_off = ((((plane0 + pp) * Bb + b) * Hb + h) * max_seq + start) * Db
+                    src_off = (((pp * Bk + b) * Hk + h) * n) * Dk
+                    err = cudart.cudaMemcpyAsync(
+                        device_addr + dst_off * isz,
+                        src_base + src_off * isz,
+                        chunk_bytes,
+                        cudart.cudaMemcpyKind.cudaMemcpyHostToDevice,
+                        self._stream,
+                    )
+                    _check(err, "cudaMemcpyAsync KV writeback")
+        err = cudart.cudaStreamSynchronize(self._stream)
+        _check(err, "cudaStreamSynchronize KV writeback")
 
     def get_pool_stats(self) -> Dict[str, Any]:
         """显存池状态，方便诊断热路径是否仍在 cudaMalloc。"""

@@ -64,6 +64,10 @@ class NPUExecutor(ABC):
         self._weight_addrs: Dict[str, int]       = {}  # 权重名 → DDR地址
         self._profiling:    bool                 = False
         self._stats:        Dict[str, list]      = {}
+        # graph_name → {input_name: 常驻 device 地址}
+        # 被绑定的输入在 run() 时不再 H2D 重传（如 decode 的 max-size KV buffer）
+        self._bound_inputs: Dict[str, Dict[str, int]] = {}
+        self._persistent_addrs: set = set()  # alloc_persistent 拿到的地址，永不 _free
 
     # ------------------------------------------------------------------
     # 公开接口（框架层调用）
@@ -91,12 +95,21 @@ class NPUExecutor(ABC):
         transient_addrs: list = []   # 本次 run 全部 alloc 的 addr，最后统一释放
 
         # 输入上传到Device（权重已经常驻Device，不在inputs里）
+        # 已 bind_input 的输入（如 decode 的 max-size KV buffer）常驻 Device，
+        # 跳过 alloc/H2D，直接复用绑定地址，避免每步自回归重传整块 KV。
+        bound = self._bound_inputs.get(graph_name, {})
         device_inputs = {}
         for k, v in inputs.items():
+            if k in bound:
+                device_inputs[k] = bound[k]
+                continue
             addr = self._alloc_device(v.nbytes)
             transient_addrs.append(addr)
             self._h2d(v, addr)
             device_inputs[k] = addr
+        # 调用方可以不在 inputs 里再传绑定输入，这里补齐供 _execute 使用
+        for k, addr in bound.items():
+            device_inputs.setdefault(k, addr)
 
         # NPU执行（输出 addr 通常由子类 _execute 内部 alloc）
         device_outputs = self._execute(meta.handle, device_inputs, meta)
@@ -135,6 +148,57 @@ class NPUExecutor(ABC):
     def get_weight_addr(self, name: str) -> int:
         assert name in self._weight_addrs, f"权重 '{name}' 未加载"
         return self._weight_addrs[name]
+
+    # ------------------------------------------------------------------
+    # 常驻 buffer / 输入绑定（decode 的 max-size KV cache 走这里）
+    # ------------------------------------------------------------------
+
+    def alloc_persistent(self, nbytes: int) -> int:
+        """
+        分配一块常驻 Device 内存（如按 max_seq_len 预分配的 KV buffer）。
+        与 _alloc_device 的区别：永远不会被 run() 的 _free_device 归还。
+        """
+        addr = self._alloc_device(nbytes)
+        self._persistent_addrs.add(addr)
+        logger.info(f"[ARIA/Executor] 分配常驻 buffer @0x{addr:x}  {nbytes/1024**2:.1f}MiB")
+        return addr
+
+    def init_persistent(self, addr: int, data: np.ndarray) -> None:
+        """一次性把初始内容（通常全零）写入常驻 buffer。"""
+        self._h2d(data, addr)
+
+    def bind_input(self, graph_name: str, input_name: str, addr: int) -> None:
+        """
+        把某张图的某个输入永久绑定到常驻 Device 地址。
+        绑定后该输入在 run() 时不再 H2D 重传。
+        """
+        self._bound_inputs.setdefault(graph_name, {})[input_name] = addr
+        logger.info(f"[ARIA/Executor] 绑定输入 {graph_name}.{input_name} → 0x{addr:x}")
+
+    def write_kv_seq(self,
+                     addr:         int,
+                     buffer_shape: tuple,
+                     dtype:        np.dtype,
+                     start:        int,
+                     block:        np.ndarray,
+                     plane0:       int = 0) -> None:
+        """
+        把一段 KV 写入常驻 buffer 的 seq 维 [start, start+n)：
+            buffer[plane0:plane0+P, :, :, start:start+n, :] = block
+        buffer_shape = [L*2, batch, heads, max_seq, head_dim]，
+        block        = [P,    batch, heads, n,       head_dim]
+          - 整块写：plane0=0, P=L*2（如 prefill 一次写所有层）
+          - 单层写：plane0=2*layer_idx, P=2（K/V 两个 plane），n=1 即 decode 单步
+
+        seq 维在倒数第二轴，这是一次**跨步写**（P*batch*heads 个 head_dim 小块），
+        总量很小。Mock 用一行 numpy 切片赋值；真实后端用跨步拷贝 / 小 kernel。
+        """
+        self._write_kv_seq(addr, tuple(buffer_shape), np.dtype(dtype),
+                           int(start), block, int(plane0))
+
+    def read_persistent(self, addr: int, shape: tuple, dtype: np.dtype) -> np.ndarray:
+        """把常驻 buffer 整块读回 host（供前缀缓存回写 / get_kv 等冷路径用）。"""
+        return self._d2h(addr, tuple(shape), np.dtype(dtype))
 
     def enable_profiling(self, enable: bool = True) -> None:
         self._profiling = enable
@@ -196,6 +260,22 @@ class NPUExecutor(ABC):
         """
         return None
 
+    def _write_kv_seq(self,
+                      addr:         int,
+                      buffer_shape: tuple,
+                      dtype:        np.dtype,
+                      start:        int,
+                      block:        np.ndarray,
+                      plane0:       int = 0) -> None:
+        """
+        把 block 跨步写入常驻 KV buffer 的 seq 维 [start, start+n)，plane 维 [plane0, plane0+P)。
+        默认未实现——支持单图 decode（固定 max buffer + 偏移）的后端必须重写。
+        参见 write_kv_seq 的文档。
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} 未实现 _write_kv_seq（单图 decode 的常驻 KV 写回）"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Mock实现（基于numpy，用于开发/测试）
@@ -254,5 +334,17 @@ class MockNPUExecutor(NPUExecutor):
 
     def _free_device(self, device_addr: int) -> None:
         # Mock 没有真实 device，简单把对应 host 副本丢掉，避免长跑时
-        # _device_mem dict 无限增长
+        # _device_mem dict 无限增长。常驻 buffer 不在 transient 列表里，不会被释放。
+        if device_addr in self._persistent_addrs:
+            return
         self._device_mem.pop(device_addr, None)
+
+    def _write_kv_seq(self, addr, buffer_shape, dtype, start, block, plane0=0) -> None:
+        buf = self._device_mem.get(addr)
+        if buf is None or buf.shape != tuple(buffer_shape):
+            # init_persistent 未先建好则按 buffer_shape 兜底建一块零 buffer
+            buf = np.zeros(buffer_shape, dtype=dtype)
+            self._device_mem[addr] = buf
+        p = block.shape[0]
+        n = block.shape[3]
+        buf[plane0:plane0 + p, :, :, start:start + n, :] = block.astype(buf.dtype)

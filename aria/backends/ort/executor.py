@@ -222,7 +222,21 @@ class ORTExecutor(NPUExecutor):
         return np.zeros(shape, dtype=dtype)
 
     def _free_device(self, device_addr: int) -> None:
+        # 常驻 buffer（如 decode 的 KV）不归还，否则下一步就丢了
+        if device_addr in self._persistent_addrs:
+            return
         self._mem.pop(device_addr, None)
+
+    def _write_kv_seq(self, device_addr, buffer_shape, dtype, start, block, plane0=0) -> None:
+        # ORT 自管 memory，这里的 fake addr 后面挂着 host 镜像 numpy；
+        # 原地跨步写，再由 _execute reshape→feed 时引用到更新后的内容
+        buf = self._mem.get(device_addr)
+        if buf is None or tuple(buf.shape) != tuple(buffer_shape):
+            buf = np.zeros(buffer_shape, dtype=dtype)
+            self._mem[device_addr] = buf
+        p = block.shape[0]
+        n = block.shape[3]
+        buf[plane0:plane0 + p, :, :, start:start + n, :] = block.astype(buf.dtype)
 
     # ------------------------------------------------------------------
     # 共享统计

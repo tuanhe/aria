@@ -42,8 +42,14 @@ class BaseExporter(ABC):
         """导出 prefill_{seq_len}.onnx，返回路径。"""
 
     @abstractmethod
-    def export_decode(self, out_dir: str, kv_len: int) -> str:
-        """导出 decode_{kv_len}.onnx，返回路径。"""
+    def export_decode(self, out_dir: str) -> str:
+        """
+        导出单张 decode.onnx，返回路径。
+
+        「固定 max buffer + 偏移」设计：decode 不再按 kv_len 分 bucket，
+        kv_cache 输入恒为 max_seq_len 长度，自回归每步只变 position_id /
+        attention_mask（数据），图本身唯一。
+        """
 
     # ------------------------------------------------------------------
     # 公共入口
@@ -73,11 +79,11 @@ class BaseExporter(ABC):
             _strip_weights(p, out_dir, offsets)
             paths.append(p)
 
-        for kv_len in self.cfg.llm.decode_buckets:
-            logger.info("[export] decode_%d", kv_len)
-            p = self.export_decode(out_dir, kv_len)
-            _strip_weights(p, out_dir, offsets)
-            paths.append(p)
+        logger.info("[export] decode (single graph, max_seq_len=%d)",
+                    self.cfg.llm.max_seq_len)
+        p = self.export_decode(out_dir)
+        _strip_weights(p, out_dir, offsets)
+        paths.append(p)
 
         weights_path = Path(out_dir) / WEIGHTS_FILE
         logger.info(

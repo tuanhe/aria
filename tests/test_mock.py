@@ -38,7 +38,6 @@ def make_vla_config(head_type: str = "flow_matching") -> FrameworkConfig:
     cfg.llm.head_dim           = 64
     cfg.llm.vocab_size         = 1000
     cfg.llm.prefill_buckets    = [128, 256]
-    cfg.llm.decode_buckets     = [128, 256]
     cfg.llm.max_seq_len        = 512
     cfg.action.head_type       = head_type
     cfg.action.action_dim      = 7
@@ -63,7 +62,6 @@ def make_vlm_config() -> FrameworkConfig:
     cfg.llm.head_dim           = 64
     cfg.llm.vocab_size         = 1000
     cfg.llm.prefill_buckets    = [512, 768, 1024]
-    cfg.llm.decode_buckets     = [512, 768, 1024]
     cfg.llm.max_seq_len        = 1024
     cfg.text.max_new_tokens    = 10
     cfg.text.do_sample         = False   # 测试用greedy，确定性输出
@@ -576,7 +574,6 @@ llm:
   num_heads: 32
   head_dim: 128
   prefill_buckets: [512, 1024]
-  decode_buckets: [512, 1024]
 action:
   head_type: flow_matching
   action_dim: 7

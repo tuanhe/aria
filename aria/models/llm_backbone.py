@@ -3,9 +3,9 @@ models/llm_backbone.py
 
 LLM Backbone推理封装。
 - 管理多个Prefill静态图（按seq_len分bucket）
-- 管理多个Decode静态图（按kv_len分bucket，AR模式用）
-- 负责Padding输入到对应bucket
-- KV Cache写入由外部KVCacheManager管理
+- 管理单张Decode静态图（固定 max buffer + 偏移，无 bucket）
+- 负责Padding prefill输入到对应bucket
+- KV Cache由 device-resident 的 KVCacheManager 管理，decode buffer 被 bind 到 decode 图
 """
 
 from __future__ import annotations
@@ -29,7 +29,8 @@ class LLMBackbone:
     LLM Backbone推理封装。
 
     Prefill图：每个seq_len bucket一张，输入token序列+视觉特征，输出hidden state + KV Cache
-    Decode图： 每个kv_len bucket一张，输入单token + 当前KV Cache长度，输出logits + 新KV
+    Decode图： 单张静态图，输入单token + position + attention_mask（kv_cache 常驻 bind），
+              输出logits + 新增一步KV
     """
 
     def __init__(self,
@@ -44,6 +45,12 @@ class LLMBackbone:
 
         self._register_prefill_graphs()
         self._register_decode_graphs()
+
+        # 把本 session 的常驻 KV buffer 绑到 decode 单图的 kv_cache 输入。
+        # 绑定后自回归每步不再 H2D 重传整块 KV，只写回新增的一行。
+        # （harvest / 纯导出场景 kv_cache=None，跳过绑定）
+        if self.kv_cache is not None:
+            self.executor.bind_input("decode", "kv_cache", self.kv_cache.addr)
 
     # ------------------------------------------------------------------
     # 图注册
@@ -94,41 +101,47 @@ class LLMBackbone:
         logger.info(f"[ARIA/LLM] 注册Prefill图: {self.lcfg.prefill_buckets} (mode={self.config.mode})")
 
     def _register_decode_graphs(self) -> None:
-        """AR模式专用：每个KV Cache长度bucket一张Decode图"""
-        for kv_len in self.lcfg.decode_buckets:
-            name = f"decode_{kv_len}"
-            meta = GraphMeta(
-                name  = name,
-                path  = f"{self.config.graph_dir}/{name}.bin",
-                input_shapes = {
-                    "input_id":   (self.config.max_batch, 1),
-                    "position_id":(self.config.max_batch, 1),
-                    # 当前有效KV Cache（只传有效部分的shape对应的最大bucket）
-                    "kv_in": (
-                        self.lcfg.num_layers * 2,
-                        self.config.max_batch,
-                        self.lcfg.num_heads,
-                        kv_len,
-                        self.lcfg.head_dim,
-                    ),
-                },
-                output_shapes = {
-                    "logits": (self.config.max_batch, self.lcfg.vocab_size),
-                    "kv_new": (
-                        self.lcfg.num_layers * 2,
-                        self.config.max_batch,
-                        self.lcfg.num_heads,
-                        1,
-                        self.lcfg.head_dim,
-                    ),
-                },
-                output_dtypes = {
-                    "logits": np.float32,
-                    "kv_new": np.float16,
-                },
-            )
-            self.executor.register_graph(meta)
-        logger.info(f"[ARIA/LLM] 注册Decode图: {self.lcfg.decode_buckets}")
+        """
+        AR / 文本 decode：单张静态图（固定 max buffer + 偏移），无 bucket。
+
+        kv_cache 输入恒为 max_seq_len 长度，作为常驻 buffer 由 executor 绑定；
+        自回归每步只变 position_id / attention_mask（数据），图本身唯一。
+        """
+        max_seq = self.lcfg.max_seq_len
+        meta = GraphMeta(
+            name  = "decode",
+            path  = f"{self.config.graph_dir}/decode.bin",
+            input_shapes = {
+                "input_id":       (self.config.max_batch, 1),
+                "position_id":    (self.config.max_batch, 1),
+                # [0,pos)=1 有效历史, [pos,MAX)=0 垃圾尾, [MAX]=1 当前 token 自身
+                "attention_mask": (self.config.max_batch, max_seq + 1),
+                # 常驻 KV buffer（max_seq_len 全长），executor 绑定，不逐步重传
+                "kv_cache": (
+                    self.lcfg.num_layers * 2,
+                    self.config.max_batch,
+                    self.lcfg.num_heads,
+                    max_seq,
+                    self.lcfg.head_dim,
+                ),
+            },
+            output_shapes = {
+                "logits": (self.config.max_batch, self.lcfg.vocab_size),
+                "kv_new": (
+                    self.lcfg.num_layers * 2,
+                    self.config.max_batch,
+                    self.lcfg.num_heads,
+                    1,
+                    self.lcfg.head_dim,
+                ),
+            },
+            output_dtypes = {
+                "logits": np.float32,
+                "kv_new": np.float16,
+            },
+        )
+        self.executor.register_graph(meta)
+        logger.info(f"[ARIA/LLM] 注册Decode单图: kv_cache max_seq={max_seq}")
 
     # ------------------------------------------------------------------
     # Prefill
@@ -191,24 +204,29 @@ class LLMBackbone:
         AR Decode单步。
 
         token_id: 上一步生成的token（或BOS）
-        返回: (logits [vocab_size], next_kv_len)
+        返回: logits [vocab_size]
         """
         cur_kv_len = self.kv_cache.valid_len
-        bucket     = self._select_decode_bucket(cur_kv_len)
+        max_seq    = self.lcfg.max_seq_len
+        assert cur_kv_len < max_seq, \
+            f"KV Cache已满: valid_len={cur_kv_len} max={max_seq}"
 
-        # 将当前有效KV Cache（pad到bucket长度）作为图输入
-        kv_padded = self._pad_kv_for_decode(cur_kv_len, bucket)
+        # attention_mask: [0,pos)=1 有效历史, [pos,MAX)=0 垃圾尾, [MAX]=1 当前 token
+        attn_mask = np.zeros((self.config.max_batch, max_seq + 1), dtype=np.int32)
+        attn_mask[:, :cur_kv_len] = 1
+        attn_mask[:, max_seq]     = 1
 
+        # kv_cache 输入已 bind 为常驻 buffer，这里不再传（executor.run 自动复用绑定地址）
         out = self.executor.run(
-            f"decode_{bucket}",
+            "decode",
             {
-                "input_id":    np.array([[token_id]], dtype=np.int32),
-                "position_id": np.array([[cur_kv_len]], dtype=np.int32),
-                "kv_in":       kv_padded,
+                "input_id":       np.array([[token_id]], dtype=np.int32),
+                "position_id":    np.array([[cur_kv_len]], dtype=np.int32),
+                "attention_mask": attn_mask,
             }
         )
 
-        # 将新生成的KV写入Cache
+        # 将新生成的KV写回常驻 buffer 第 cur_kv_len 行
         kv_new = out["kv_new"]  # [num_layers*2, batch, heads, 1, head_dim]
         for layer_idx in range(self.lcfg.num_layers):
             k = kv_new[layer_idx * 2    ]
@@ -257,33 +275,10 @@ class LLMBackbone:
 
         return bucket, padded_ids, attention_mask, position_ids
 
-    def _pad_kv_for_decode(self, cur_len: int, bucket: int) -> np.ndarray:
-        """
-        将KV Cache pad到bucket长度作为Decode图输入。
-        [num_layers*2, batch, heads, bucket, head_dim]
-        """
-        full_kv = self.kv_cache.get_all_kv()
-        # full_kv: [num_layers, 2, batch, heads, valid_len, head_dim]
-        nl, _, b, h, vl, d = full_kv.shape
-        # 展平layers×2，pad seq维度到bucket
-        flat = full_kv.reshape(nl * 2, b, h, vl, d)
-        if vl < bucket:
-            pad = np.zeros((nl * 2, b, h, bucket - vl, d), dtype=flat.dtype)
-            flat = np.concatenate([flat, pad], axis=3)
-        return flat[:, :, :, :bucket, :]
-
     def _select_prefill_bucket(self, length: int) -> int:
         for b in sorted(self.lcfg.prefill_buckets):
             if length <= b:
                 return b
         raise ValueError(
             f"序列长度 {length} 超过最大Prefill bucket {max(self.lcfg.prefill_buckets)}"
-        )
-
-    def _select_decode_bucket(self, kv_len: int) -> int:
-        for b in sorted(self.lcfg.decode_buckets):
-            if kv_len <= b:
-                return b
-        raise ValueError(
-            f"KV Cache长度 {kv_len} 超过最大Decode bucket {max(self.lcfg.decode_buckets)}"
         )

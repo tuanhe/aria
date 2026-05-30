@@ -56,6 +56,7 @@ class VLARuntime:
             head_dim    = config.llm.head_dim,
             max_seq_len = config.llm.max_seq_len,
             max_batch   = config.max_batch,
+            executor    = self.executor,
         )
 
         # 子模块

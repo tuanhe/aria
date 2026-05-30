@@ -44,7 +44,7 @@ class LLMConfig:
     head_dim:         int       = 128
     vocab_size:       int       = 152064      # Qwen3 vocab
     prefill_buckets:  List[int] = field(default_factory=lambda: [512, 1024, 2048])
-    decode_buckets:   List[int] = field(default_factory=lambda: [512, 1024, 2048])
+    # decode 不再分 bucket：单图 + 固定 max buffer + 偏移，buffer 长度 = max_seq_len
     max_seq_len:      int       = 4096
 
 
@@ -111,7 +111,6 @@ class FrameworkConfig:
                 head_dim        = l.get("head_dim",        cfg.llm.head_dim),
                 vocab_size      = l.get("vocab_size",      cfg.llm.vocab_size),
                 prefill_buckets = l.get("prefill_buckets", cfg.llm.prefill_buckets),
-                decode_buckets  = l.get("decode_buckets",  cfg.llm.decode_buckets),
                 max_seq_len     = l.get("max_seq_len",     cfg.llm.max_seq_len),
             )
 

@@ -104,7 +104,7 @@ class TinyLLM(nn.Module):
         self.cfg = cfg
         H = cfg.llm.hidden_dim
         max_pos = (cfg.llm.max_seq_len
-                   + max([0] + cfg.llm.prefill_buckets + cfg.llm.decode_buckets)
+                   + max([0] + cfg.llm.prefill_buckets)
                    + 64)
         self.token_emb   = nn.Embedding(cfg.llm.vocab_size, H)
         self.pos_emb     = nn.Embedding(max_pos, H)

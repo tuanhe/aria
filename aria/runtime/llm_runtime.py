@@ -110,6 +110,7 @@ class LLMRuntime:
             head_dim    = self.config.llm.head_dim,
             max_seq_len = self.config.llm.max_seq_len,
             max_batch   = self.config.max_batch,
+            executor    = self.executor,
         )
         self._sessions[sid] = Session(sid, kv_cache)
         logger.info("[ARIA/LLM] 新建 session: %s", sid)

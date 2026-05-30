@@ -147,9 +147,9 @@ def _shared_params_for(graph_name: str,
     if graph_name == "vision_encoder":
         d = cfg.vision.feat_dim
         return {"vision_proj.weight": ((d, d), np.dtype(np.float16))}
-    if graph_name.startswith("prefill_") or graph_name.startswith("decode_"):
+    if graph_name.startswith("prefill_") or graph_name.startswith("decode"):
         d = cfg.llm.hidden_dim
-        # 所有 prefill_* / decode_* 共用同一份 llm_proj.weight
+        # 所有 prefill_* / 单图 decode 共用同一份 llm_proj.weight
         return {"llm_proj.weight": ((d, d), np.dtype(np.float16))}
     if graph_name == "flow_head":
         d = cfg.action.action_dim

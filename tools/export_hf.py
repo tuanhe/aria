@@ -111,17 +111,14 @@ def _export_subset(exporter, cfg, out_dir: str, only: str):
         if only in ("prefill", name):
             paths.append(exporter.export_prefill(out_dir, seq_len))
 
-    for kv_len in cfg.llm.decode_buckets:
-        name = f"decode_{kv_len}"
-        if only in ("decode", name):
-            paths.append(exporter.export_decode(out_dir, kv_len))
+    if only == "decode":
+        paths.append(exporter.export_decode(out_dir))
 
     if not paths:
         raise ValueError(
             f"--only '{only}' 没有匹配任何图。"
             f"可选: prefill, decode, "
-            f"{[f'prefill_{b}' for b in cfg.llm.prefill_buckets]}, "
-            f"{[f'decode_{b}' for b in cfg.llm.decode_buckets]}"
+            f"{[f'prefill_{b}' for b in cfg.llm.prefill_buckets]}, decode"
         )
     return paths
 

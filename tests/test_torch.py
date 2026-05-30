@@ -47,7 +47,6 @@ def _tiny_text_cfg() -> FrameworkConfig:
     cfg.llm.head_dim           = 16
     cfg.llm.vocab_size         = 256
     cfg.llm.prefill_buckets    = [64, 128]
-    cfg.llm.decode_buckets     = [64, 128]
     cfg.llm.max_seq_len        = 128
     return cfg
 
@@ -65,7 +64,6 @@ def _vla_cfg() -> FrameworkConfig:
     cfg.llm.head_dim               = 16
     cfg.llm.vocab_size             = 256
     cfg.llm.prefill_buckets        = [128, 256]
-    cfg.llm.decode_buckets         = [128, 256]
     cfg.llm.max_seq_len            = 256
     cfg.action.head_type           = "flow_matching"
     cfg.action.action_dim          = 7
@@ -89,7 +87,6 @@ def _vlm_cfg() -> FrameworkConfig:
     cfg.llm.head_dim           = 16
     cfg.llm.vocab_size         = 256
     cfg.llm.prefill_buckets    = [256, 512]
-    cfg.llm.decode_buckets     = [256, 512]
     cfg.llm.max_seq_len        = 512
     cfg.text.max_new_tokens    = 5
     cfg.text.do_sample         = False
